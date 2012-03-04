@@ -25,6 +25,7 @@
 #include "server_room.h"
 #include "serversocketinterface.h"
 #include "serversocketthread.h"
+#include "networkserverthread.h"
 #include "server_logger.h"
 #include "main.h"
 #include "passwordhasher.h"
@@ -34,7 +35,7 @@
 #include "pb/event_server_shutdown.pb.h"
 #include "pb/event_connection_closed.pb.h"
 
-void Servatrice_TcpServer::incomingConnection(int socketDescriptor)
+void Servatrice_GameServer::incomingConnection(int socketDescriptor)
 {
 	if (threaded) {
 		ServerSocketThread *sst = new ServerSocketThread(socketDescriptor, server, this);
@@ -45,6 +46,12 @@ void Servatrice_TcpServer::incomingConnection(int socketDescriptor)
 		ServerSocketInterface *ssi = new ServerSocketInterface(server, socket);
 		logger->logMessage(QString("incoming connection: %1").arg(socket->peerAddress().toString()), ssi);
 	}
+}
+
+void Servatrice_NetworkServer::incomingConnection(int socketDescriptor)
+{
+	NetworkServerThread *thread = new NetworkServerThread(socketDescriptor, server, cert, privateKey);
+	thread->start();
 }
 
 Servatrice::Servatrice(QSettings *_settings, QObject *parent)
@@ -65,13 +72,13 @@ Servatrice::Servatrice(QSettings *_settings, QObject *parent)
 	}
 	
 	threaded = settings->value("server/threaded", false).toInt();
-	tcpServer = new Servatrice_TcpServer(this, threaded, this);
-	int port = settings->value("server/port", 4747).toInt();
-	qDebug() << "Starting server on port" << port;
-	if (tcpServer->listen(QHostAddress::Any, port))
+	gameServer = new Servatrice_GameServer(this, threaded, this);
+	const int gamePort = settings->value("server/port", 4747).toInt();
+	qDebug() << "Starting server on port" << gamePort;
+	if (gameServer->listen(QHostAddress::Any, gamePort))
 		qDebug() << "Server listening.";
 	else
-		qDebug() << "tcpServer->listen(): Error.";
+		qDebug() << "gameServer->listen(): Error.";
 	
 	const QString authenticationMethodStr = settings->value("authentication/method").toString();
 	if (authenticationMethodStr == "sql")
@@ -87,6 +94,40 @@ Servatrice::Servatrice(QSettings *_settings, QObject *parent)
 	dbPrefix = settings->value("database/prefix").toString();
 	if (databaseType != DatabaseNone)
 		openDatabase();
+	
+	updateServerList();
+	clearSessionTables();
+	
+	try { if (settings->value("servernetwork/active", 0).toInt()) {
+		qDebug() << "Connecting to server network.";
+		const QString certFileName = settings->value("servernetwork/ssl_cert").toString();
+		const QString keyFileName = settings->value("servernetwork/ssl_key").toString();
+		qDebug() << "Loading certificate...";
+		QFile certFile(certFileName);
+		if (!certFile.open(QIODevice::ReadOnly))
+			throw QString("Error opening certificate file: %1").arg(certFileName);
+		QSslCertificate cert(&certFile);
+		if (!cert.isValid())
+			throw(QString("Invalid certificate."));
+		qDebug() << "Loading private key...";
+		QFile keyFile(keyFileName);
+		if (!keyFile.open(QIODevice::ReadOnly))
+			throw QString("Error opening private key file: %1").arg(keyFileName);
+		QSslKey key(&keyFile, QSsl::Rsa, QSsl::Pem, QSsl::PrivateKey);
+		if (key.isNull())
+			throw QString("Invalid private key.");
+		
+		const int networkPort = settings->value("servernetwork/port", 14747).toInt();
+		qDebug() << "Starting network server on port" << networkPort;
+		
+		networkServer = new Servatrice_NetworkServer(this, cert, key, this);
+		if (networkServer->listen(QHostAddress::Any, networkPort))
+			qDebug() << "Network server listening.";
+		else
+			throw QString("networkServer->listen(): Error.");
+	} } catch (QString error) {
+		qDebug() << "ERROR --" << error;
+	}
 	
 	int size = settings->beginReadArray("rooms");
 	for (int i = 0; i < size; ++i) {
@@ -189,6 +230,34 @@ bool Servatrice::execSqlQuery(QSqlQuery &query)
 		return true;
 	qCritical() << "Database error:" << query.lastError().text();
 	return false;
+}
+
+void Servatrice::updateServerList()
+{
+	qDebug() << "Updating server list...";
+	
+	serverListMutex.lock();
+	serverList.clear();
+	
+	QSqlQuery query;
+	query.prepare("select id, ssl_cert, hostname, address, game_port, control_port from " + dbPrefix + "_servers order by id asc");
+	execSqlQuery(query);
+	while (query.next()) {
+		ServerProperties prop(query.value(0).toInt(), QSslCertificate(query.value(1).toString().toAscii()), query.value(2).toString(), QHostAddress(query.value(3).toString()), query.value(4).toInt(), query.value(5).toInt());
+		serverList.append(prop);
+		qDebug() << QString("#%1 CERT=%2 NAME=%3 IP=%4:%5 CPORT=%6").arg(prop.id).arg(QString(prop.cert.digest().toHex())).arg(prop.hostname).arg(prop.address.toString()).arg(prop.gamePort).arg(prop.controlPort);
+	}
+	
+	serverListMutex.unlock();
+}
+
+QList<ServerProperties> Servatrice::getServerList() const
+{
+	serverListMutex.lock();
+	QList<ServerProperties> result = serverList;
+	serverListMutex.unlock();
+	
+	return result;
 }
 
 AuthenticationResult Servatrice::checkUserPassword(Server_ProtocolHandler *handler, const QString &user, const QString &password, QString &reasonStr)
@@ -417,6 +486,37 @@ QList<ServerSocketInterface *> Servatrice::getUsersWithAddressAsList(const QHost
 	return result;
 }
 
+void Servatrice::clearSessionTables()
+{
+	lockSessionTables();
+	QSqlQuery query;
+	query.prepare("update " + dbPrefix + "_sessions set end_time=now() where end_time is null and id_server = :id_server");
+	query.bindValue(":id_server", serverId);
+	query.exec();
+	unlockSessionTables();
+}
+
+void Servatrice::lockSessionTables()
+{
+	QSqlQuery("lock tables " + dbPrefix + "_sessions write, " + dbPrefix + "_users read").exec();
+}
+
+void Servatrice::unlockSessionTables()
+{
+	QSqlQuery("unlock tables").exec();
+}
+
+bool Servatrice::userSessionExists(const QString &userName)
+{
+	// Call only after lockSessionTables().
+	
+	QSqlQuery query;
+	query.prepare("select 1 from " + dbPrefix + "_sessions where user_name = :user_name and end_time is null");
+	query.bindValue(":user_name", userName);
+	query.exec();
+	return query.next();
+}
+
 int Servatrice::startSession(const QString &userName, const QString &address)
 {
 	if (authenticationMethod == AuthenticationNone)
@@ -445,9 +545,11 @@ void Servatrice::endSession(int sessionId)
 		return;
 	
 	QSqlQuery query;
+	query.exec("lock tables " + dbPrefix + "_sessions read");
 	query.prepare("update " + dbPrefix + "_sessions set end_time=NOW() where id = :id_session");
 	query.bindValue(":id_session", sessionId);
 	execSqlQuery(query);
+	query.exec("unlock tables");
 }
 
 QMap<QString, ServerInfo_User> Servatrice::getBuddyList(const QString &name)
@@ -706,4 +808,15 @@ void Servatrice::shutdownTimeout()
 	
 	if (!shutdownMinutes)
 		deleteLater();
+}
+
+void Servatrice::addNetworkServerInterface(NetworkServerInterface *interface)
+{
+	networkServerInterfaces.append(interface);
+}
+
+void Servatrice::removeNetworkServerInterface(NetworkServerInterface *interface)
+{
+	// XXX we probably need to delete everything that belonged to it...
+	networkServerInterfaces.removeAt(networkServerInterfaces.indexOf(interface));
 }
