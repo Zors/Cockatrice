@@ -263,9 +263,10 @@ QVector<QPair<int, int> > InnerDecklistNode::sort(Qt::SortOrder order)
 }
 
 const QStringList DeckList::fileNameFilters = QStringList()
+        << QObject::tr("All files (*.*)")
 	<< QObject::tr("Cockatrice decks (*.cod)")
-	<< QObject::tr("Plain text decks (*.dec *.mwDeck)")
-	<< QObject::tr("All files (*.*)");
+        << QObject::tr("Plain text decks (*.dec *.mwDeck)");
+
 
 DeckList::DeckList()
 {
@@ -506,8 +507,8 @@ bool DeckList::saveToFile(const QString &fileName, FileFormat fmt)
 DeckList::FileFormat DeckList::getFormatFromNameFilter(const QString &selectedNameFilter)
 {
 	switch (fileNameFilters.indexOf(selectedNameFilter)) {
-		case 0: return CockatriceFormat;
-		case 1: return PlainTextFormat;
+                case 1: return CockatriceFormat;
+                case 0: return PlainTextFormat;
 	}
 	return PlainTextFormat;
 }
